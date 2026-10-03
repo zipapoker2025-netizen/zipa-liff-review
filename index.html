@@ -90,22 +90,43 @@ figure img{display:block;width:100%;height:auto;background:var(--white);border:1
 (() => {
   const KEY = 'zipa-review-pass';
   const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-  let payload = null;
+  // Start downloading while the visitor is still typing the passphrase.
+  // payload.json holds the KDF parameters and the encrypted table of contents only;
+  // each image is its own encrypted file, fetched when it nears the viewport.
+  let payload = fetch('payload.json', { cache: 'no-cache' }).then(r => { if (!r.ok) throw new Error('payload'); return r.json(); });
+  payload.catch(() => { payload = null; });
+  const load = () => payload || (payload = fetch('payload.json', { cache: 'no-cache' }).then(r => r.json()));
+  // Warm the first screen's images too; their names are fixed by build order.
+  const early = new Map(['img/01.bin', 'img/02.bin', 'img/03.bin', 'img/04.bin']
+    .map(u => [u, fetch(u).then(r => r.ok ? r.arrayBuffer() : null).catch(() => null)]));
+  let key = null;
 
-  async function load() {
-    if (!payload) payload = await (await fetch('payload.json', { cache: 'no-cache' })).json();
-    return payload;
-  }
+  // Files are IV (12 bytes) followed by AES-GCM ciphertext.
+  const open = buf => crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.slice(0, 12) }, key, buf.slice(12));
 
   async function decrypt(pass) {
     const p = await load();
     const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
-    const key = await crypto.subtle.deriveKey(
+    key = await crypto.subtle.deriveKey(
       { name: 'PBKDF2', hash: 'SHA-256', salt: b64(p.salt), iterations: p.iter },
       base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(p.iv) }, key, b64(p.data));
-    return JSON.parse(new TextDecoder().decode(plain));
+    return JSON.parse(new TextDecoder().decode(await open(b64(p.data))));
   }
+
+  async function show(img) {
+    if (img.dataset.state) return;
+    img.dataset.state = 'loading';
+    try {
+      const u = img.dataset.src;
+      const buf = (early.has(u) && await early.get(u)) || await (await fetch(u)).arrayBuffer();
+      early.delete(u);
+      img.src = URL.createObjectURL(new Blob([await open(new Uint8Array(buf))], { type: 'image/webp' }));
+      img.dataset.state = 'ready';
+    } catch (e) { delete img.dataset.state; }
+  }
+  const lazy = new IntersectionObserver(entries => {
+    for (const e of entries) if (e.isIntersecting) { lazy.unobserve(e.target); show(e.target); }
+  }, { rootMargin: '800px 0px' });
 
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 
@@ -130,10 +151,13 @@ figure img{display:block;width:100%;height:auto;background:var(--white);border:1
       for (const it of s.items) {
         const fig = el('figure');
         const img = el('img');
-        img.src = 'data:image/png;base64,' + it.img;
+        // Width and height reserve the space so the page does not jump as images arrive.
+        img.width = it.w;
+        img.height = it.h;
+        img.dataset.src = it.src;
         img.alt = it.label;
-        img.loading = 'lazy';
         img.dataset.kind = it.kind;
+        lazy.observe(img);
         fig.append(img, el('figcaption', 'mono', it.label));
         grid.append(fig);
       }
@@ -175,6 +199,7 @@ figure img{display:block;width:100%;height:auto;background:var(--white);border:1
   const close = () => { lb.classList.remove('on'); document.body.style.overflow = ''; };
   document.addEventListener('click', e => {
     if (e.target.matches('figure img')) {
+      if (e.target.dataset.state !== 'ready') return;
       lb.querySelector('img').src = e.target.src;
       lb.classList.toggle('wide', e.target.dataset.kind === 'wide');
       lb.classList.add('on');
